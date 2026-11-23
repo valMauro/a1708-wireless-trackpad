@@ -1,0 +1,97 @@
+<title>Scocca trackpad A1708</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{--bg:#f4f4f2;color-scheme:light;--fg:#1d1d1f;--mut:#6b6b70;--card:#ffffff;--line:#d9d9de;--acc:#5b3fd0}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#17171a;--fg:#ececf0;--mut:#9a9aa3;--card:#222227;--line:#34343b;--acc:#a08cff;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#17171a;--fg:#ececf0;--mut:#9a9aa3;--card:#222227;--line:#34343b;--acc:#a08cff;color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding-block:16px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+h1{font-size:22px;margin:4px 0 2px}
+p.sub{color:var(--mut);margin:0 0 12px}
+.stage{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+canvas{display:block;width:100%;height:min(68vh,620px);touch-action:none;cursor:grab}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.bar label{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 12px;cursor:pointer;user-select:none}
+.bar button{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:999px;padding:6px 12px;cursor:pointer;font:inherit}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+.hint{position:absolute;left:12px;bottom:10px;color:var(--mut);font-size:13px;pointer-events:none}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:6px}
+.facts div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.facts b{display:block;font-size:13px;color:var(--mut);font-weight:500}
+</style>
+<div class="wrap">
+<h1>Scocca a cuneo del trackpad</h1>
+<p class="sub">Trascina per ruotare, rotella o due dita per lo zoom. Accendi e spegni i pezzi qui sotto.</p>
+<div class="bar" id="bar"></div>
+<div class="stage"><canvas id="c"></canvas><div class="hint">trascina = ruota · rotella = zoom</div></div>
+<div class="facts">
+<div><b>Ingombro</b>__SIZE__</div>
+<div><b>Inclinazione</b>__ANGLE__</div>
+<div><b>Pezzi da stampare</b>guscio, fondo, telaio di prova</div>
+<div><b>Viti</b>6 × M2,5 da 10 mm (fondo) · 4 × M2 da 6 mm (scheda) · 6 viti originali T5 (trackpad)</div>
+</div>
+</div>
+<script>
+const PARTS = __PARTS__;
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl', {antialias: true, preserveDrawingBuffer: true});
+function b64(s){const b=atob(s);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u.buffer}
+const vs=`attribute vec3 p;attribute vec3 n;uniform mat4 M;uniform mat4 R;varying vec3 vn;void main(){vn=(R*vec4(n,0.)).xyz;gl_Position=M*vec4(p,1.);}`;
+const fs=`precision mediump float;varying vec3 vn;uniform vec3 col;uniform float a;void main(){vec3 N=normalize(vn);if(!gl_FrontFacing)N=-N;float d=max(dot(N,normalize(vec3(.35,.45,.85))),0.);float d2=max(dot(N,normalize(vec3(-.6,-.2,.3))),0.);gl_FragColor=vec4(col*(.32+.58*d+.18*d2),a);}`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o}
+const pr=gl.createProgram();gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(pr);gl.useProgram(pr);
+const ext=gl.getExtension('OES_element_index_uint');
+const L={p:gl.getAttribLocation(pr,'p'),n:gl.getAttribLocation(pr,'n'),M:gl.getUniformLocation(pr,'M'),R:gl.getUniformLocation(pr,'R'),col:gl.getUniformLocation(pr,'col'),a:gl.getUniformLocation(pr,'a')};
+const meshes=PARTS.map(P=>{
+  const v=new Float32Array(b64(P.v)), f=new Uint32Array(b64(P.f));
+  const nrm=new Float32Array(v.length);
+  for(let i=0;i<f.length;i+=3){const a=f[i]*3,b=f[i+1]*3,c=f[i+2]*3;
+    const ux=v[b]-v[a],uy=v[b+1]-v[a+1],uz=v[b+2]-v[a+2],wx=v[c]-v[a],wy=v[c+1]-v[a+1],wz=v[c+2]-v[a+2];
+    const nx=uy*wz-uz*wy,ny=uz*wx-ux*wz,nz=ux*wy-uy*wx;
+    for(const k of [a,b,c]){nrm[k]+=nx;nrm[k+1]+=ny;nrm[k+2]+=nz}}
+  const bv=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,bv);gl.bufferData(gl.ARRAY_BUFFER,v,gl.STATIC_DRAW);
+  const bn=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,bn);gl.bufferData(gl.ARRAY_BUFFER,nrm,gl.STATIC_DRAW);
+  const bi=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,bi);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,f,gl.STATIC_DRAW);
+  return {bv,bn,bi,count:f.length,col:P.col,a:P.a,name:P.name,on:P.on!==false};
+});
+const bar=document.getElementById('bar');
+meshes.forEach(m=>{const l=document.createElement('label');const c=document.createElement('input');c.type='checkbox';c.checked=m.on;c.onchange=()=>{m.on=c.checked;draw()};
+  const s=document.createElement('span');s.className='sw';s.style.background=`rgb(${m.col.map(x=>x*255|0).join(',')})`;l.append(c,s,document.createTextNode(m.name));bar.append(l)});
+const views={'Davanti':[-0.95,0.55],'Retro':[2.2,0.45],'Lato':[-1.57,0.08],'Sopra':[-1.57,1.45]};
+for(const k in views){const b=document.createElement('button');b.textContent=k;b.onclick=()=>{[yaw,pitch]=views[k];draw()};bar.append(b)}
+let yaw=-0.95,pitch=0.55,dist=330;const C=[__CX__,__CY__,__CZ__];
+function mul(a,b){const o=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s}return o}
+function draw(){
+  const w=cv.clientWidth*devicePixelRatio,h=cv.clientHeight*devicePixelRatio;if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}
+  gl.viewport(0,0,w,h);const dark=getComputedStyle(document.documentElement).getPropertyValue('--card').trim();
+  const bg=dark.startsWith('#2')?[.13,.13,.15]:[1,1,1];gl.clearColor(bg[0],bg[1],bg[2],1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.enable(gl.DEPTH_TEST);
+  const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+  // world Z up; rotate around Z (yaw) then tilt (pitch)
+  const Rz=[cy,sy,0,0,-sy,cy,0,0,0,0,1,0,0,0,0,1];
+  const Rx=[1,0,0,0,0,sp,-cp,0,0,cp,sp,0,0,0,0,1];
+  const R=mul(Rx,Rz);
+  const T=[1,0,0,0,0,1,0,0,0,0,1,0,-C[0],-C[1],-C[2],1];
+  const V=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,-dist,1];
+  const asp=w/h,fov=0.55,f=1/Math.tan(fov/2),nr=10,fr=2000;
+  const Pm=[f/asp,0,0,0,0,f,0,0,0,0,(fr+nr)/(nr-fr),-1,0,0,2*fr*nr/(nr-fr),0];
+  const M=mul(Pm,mul(V,mul(R,T)));
+  gl.uniformMatrix4fv(L.M,false,M);gl.uniformMatrix4fv(L.R,false,R);
+  const order=[...meshes].sort((a,b)=>b.a-a.a);
+  for(const m of order){if(!m.on)continue;
+    if(m.a<1){gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false)}else{gl.disable(gl.BLEND);gl.depthMask(true)}
+    gl.uniform3fv(L.col,m.col);gl.uniform1f(L.a,m.a);
+    gl.bindBuffer(gl.ARRAY_BUFFER,m.bv);gl.enableVertexAttribArray(L.p);gl.vertexAttribPointer(L.p,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,m.bn);gl.enableVertexAttribArray(L.n);gl.vertexAttribPointer(L.n,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,m.bi);gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_INT,0)}
+  gl.depthMask(true);
+}
+let drag=null;
+cv.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId)});
+cv.addEventListener('pointermove',e=>{if(!drag)return;yaw-=(e.clientX-drag[0])*0.008;pitch=Math.max(-1.5,Math.min(1.55,pitch+(e.clientY-drag[1])*0.008));drag=[e.clientX,e.clientY];draw()});
+cv.addEventListener('pointerup',()=>drag=null);
+cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(120,Math.min(900,dist*(1+Math.sign(e.deltaY)*0.08)));draw()},{passive:false});
+addEventListener('resize',draw);
+window.setView=(y,p,d)=>{yaw=y;pitch=p;if(d)dist=d;draw()};
+window.setOn=(arr)=>{meshes.forEach((m,i)=>m.on=arr[i]);draw()};
+draw();
+</script>

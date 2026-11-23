@@ -1,0 +1,807 @@
+diff --git a/src/gesture.rs b/src/gesture.rs
+index 8d1f3f8..26f2e6a 100644
+--- a/src/gesture.rs
++++ b/src/gesture.rs
+@@ -28,8 +28,37 @@ const TAP_MAX_MOVE_MM: f64 = 1.0;
+ /// tightened from 220 ms to keep slow / barely-moving touches from
+ /// delaying scroll onset.
+ const TAP_MAX_DURATION: Duration = Duration::from_millis(150);
++/// Un tocco piu' breve di cosi' non e' un dito vero (un frame sul bordo,
++/// un rimbalzo): mai un clic.
++const TAP_MIN_DURATION: Duration = Duration::from_millis(40);
++
++/// "Tocca per fare clic" come nelle Impostazioni di Sistema del Mac.
++#[cfg(not(test))]
++fn taps_on() -> bool {
++    crate::system_prefs::tap_to_click()
++}
++#[cfg(test)]
++fn taps_on() -> bool {
++    true
++}
++/// Un tocco finito puo' diventare un clic?
++#[cfg(not(test))]
++fn tap_ok(dur: Duration) -> bool {
++    taps_on() && dur >= TAP_MIN_DURATION
++}
++#[cfg(test)]
++fn tap_ok(_dur: Duration) -> bool {
++    true
++}
+ /// Centroid motion below this between frames is treated as jitter.
+ const MOTION_DEAD_ZONE_MM: f64 = 0.04;
++/// Cursor-only: motion is *accumulated* until it exceeds this, instead of
++/// being discarded frame by frame. With a per-frame 0.04 mm gate, any
++/// finger slower than ~5 mm/s (at 125 Hz) never moved the pointer, which
++/// made fine positioning impossible. Accumulation older than
++/// `CURSOR_ACCUM_MAX_AGE` is dropped so a resting finger can't drift.
++const CURSOR_DEAD_ZONE_MM: f64 = 0.02;
++const CURSOR_ACCUM_MAX_AGE: Duration = Duration::from_millis(300);
+ 
+ /// Centroid pan distance needed to lock 2F mode = pan.
+ const PAN_LOCK_MM: f64 = 0.4;
+@@ -644,6 +673,8 @@ pub struct State<O: Output> {
+     /// movement is the difference between motion and a stuck cursor.
+     /// Reset on transitions out of `OneFinger`.
+     cursor_carry_x_px: f64,
++    /// Sub-dead-zone cursor motion waiting to be emitted (mm, mm, time).
++    cursor_accum: (f64, f64, Duration),
+     cursor_carry_y_px: f64,
+     /// Timestamp of the previous `on_frame_at` call. Used to derive
+     /// per-frame `dt`, which is stamped onto `pending_motion` so the
+@@ -685,6 +716,9 @@ pub struct State<O: Output> {
+     /// A physical click consumes tap eligibility until both the button
+     /// and every contact have lifted, including asynchronous lifts.
+     physical_button_used: bool,
++    /// The current physical press started with two or more fingers and
++    /// was turned into a right click; its release must not send a left-up.
++    right_press: bool,
+ 
+     /// Contact selected to drive cursor motion while the physical button is
+     /// held with multiple fingers on the pad. Once selected, the contact ID
+@@ -757,6 +791,7 @@ impl<O: Output> State<O> {
+             pad: None,
+             cursor_accel,
+             cursor_carry_x_px: 0.0,
++            cursor_accum: (0.0, 0.0, Duration::ZERO),
+             cursor_carry_y_px: 0.0,
+             prev_frame_at: None,
+             pending_two_finger_tap: None,
+@@ -765,6 +800,7 @@ impl<O: Output> State<O> {
+             suppress_one_finger_click: false,
+             prev_button: false,
+             physical_button_used: false,
++            right_press: false,
+             physical_drag_contact_id: None,
+             physical_drag_pending_motion: None,
+             observer: None,
+@@ -900,7 +936,19 @@ impl<O: Output> State<O> {
+         // frame as a finger movement turns into a real drag (the
+         // emitter promotes the subsequent move to `LeftMouseDragged`).
+         if frame.button != self.prev_button {
+-            self.out.set_left_button_held(frame.button);
++            // Pressing the pad with exactly two fingers down is a
++            // secondary click, as on Apple trackpads. With 1, 3 or 4
++            // fingers the physical click stays a normal left click.
++            let fingers_down = frame.contacts.iter().filter(|c| c.tip).count();
++            if frame.button && fingers_down == 2 {
++                self.right_press = true;
++                self.out.click(MouseButton::Right);
++                log::debug!("2f physical press: click Right");
++            } else if !frame.button && self.right_press {
++                self.right_press = false;
++            } else {
++                self.out.set_left_button_held(frame.button);
++            }
+             self.prev_button = frame.button;
+ 
+             if !frame.button {
+@@ -1234,6 +1282,7 @@ impl<O: Output> State<O> {
+                         if !self.physical_button_used
+                             && total_dur < TAP_MAX_DURATION
+                             && combined_max_move < TAP_MAX_MOVE_MM
++                            && tap_ok(total_dur)
+                         {
+                             log::debug!(
+                                 "2f tap (split lift): click Right (total_dur={}ms combined_max_move={:.2}mm)",
+@@ -1259,6 +1308,7 @@ impl<O: Output> State<O> {
+                         if !self.physical_button_used
+                             && dur < TAP_MAX_DURATION
+                             && max_move < TAP_MAX_MOVE_MM
++                            && tap_ok(dur)
+                         {
+                             log::debug!(
+                                 "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
+@@ -1331,7 +1381,8 @@ impl<O: Output> State<O> {
+             GestureKind::TwoFingerUnclassified => {
+                 let dur = now - self.started_at;
+                 let max_move = self.max_move_sq.sqrt();
+-                let tap_eligible = !self.physical_button_used
++                let tap_eligible = taps_on()
++                    && !self.physical_button_used
+                     && dur < TAP_MAX_DURATION
+                     && max_move < TAP_MAX_MOVE_MM;
+                 if matches!(new_kind, GestureKind::Idle) {
+@@ -1341,7 +1392,7 @@ impl<O: Output> State<O> {
+                             dur.as_millis(),
+                             max_move,
+                         );
+-                    } else if tap_eligible {
++                    } else if tap_eligible && tap_ok(dur) {
+                         log::debug!(
+                             "2f tap: click Right (dur={}ms max_move={:.2}mm)",
+                             dur.as_millis(),
+@@ -1801,7 +1852,7 @@ impl<O: Output> State<O> {
+         let max_move = tr.max_move_sq.sqrt();
+         let dur = now - self.started_at;
+         let could_still_tap =
+-            !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
++            taps_on() && !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+         if could_still_tap {
+             self.pending_motion = None;
+             return;
+@@ -1815,7 +1866,7 @@ impl<O: Output> State<O> {
+         // the centroid-shift jump that capacitive trackpads commonly
+         // report on the last with-finger frame.
+         if let Some((bdx, bdy, bdt)) = self.pending_motion.take()
+-            && (bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM)
++            && let Some((bdx, bdy, bdt)) = self.accumulate_cursor(bdx, bdy, bdt)
+         {
+             let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
+             if dx_px != 0 || dy_px != 0 {
+@@ -1842,6 +1893,25 @@ impl<O: Output> State<O> {
+     /// purely-vertical motion doesn't get amplified by an unrelated
+     /// horizontal velocity — it's the magnitude on that axis that
+     /// determines that axis's gain.
++    /// Add a frame's motion to the cursor accumulator; return the total
++    /// once it is large enough to emit.
++    fn accumulate_cursor(&mut self, dx: f64, dy: f64, dt: Duration) -> Option<(f64, f64, Duration)> {
++        let (mut ax, mut ay, mut at) = self.cursor_accum;
++        if at > CURSOR_ACCUM_MAX_AGE {
++            (ax, ay, at) = (0.0, 0.0, Duration::ZERO);
++        }
++        ax += dx;
++        ay += dy;
++        at += dt;
++        if ax.abs() > CURSOR_DEAD_ZONE_MM || ay.abs() > CURSOR_DEAD_ZONE_MM {
++            self.cursor_accum = (0.0, 0.0, Duration::ZERO);
++            Some((ax, ay, at))
++        } else {
++            self.cursor_accum = (ax, ay, at);
++            None
++        }
++    }
++
+     fn cursor_pixels_for(&mut self, dx_mm: f64, dy_mm: f64, dt: Duration) -> (i32, i32) {
+         let dt_s = dt.as_secs_f64();
+         // dt is clamped in `on_frame_at`, so this can't be zero. But
+@@ -1850,10 +1920,21 @@ impl<O: Output> State<O> {
+         if dt_s <= 0.0 {
+             return (0, 0);
+         }
+-        let vx = dx_mm / dt_s;
+-        let vy = dy_mm / dt_s;
+-        let px_x = accelerate_cursor(vx, self.cursor_accel) * dt_s;
+-        let px_y = accelerate_cursor(vy, self.cursor_accel) * dt_s;
++        // Curva di Apple (quella del trackpad del MacBook), applicata alla
++        // velocita' totale come fa macOS: la direzione non cambia con la
++        // velocita'. Il cursore "Velocita' di tracciamento" delle
++        // Impostazioni di Sistema sceglie la curva.
++        let v = (dx_mm * dx_mm + dy_mm * dy_mm).sqrt() / dt_s;
++        // La "sensibilita'" dell'app fa da moltiplicatore: 25 (il valore
++        // predefinito) = esattamente come il MacBook.
++        let k = if v > 0.0 {
++            crate::apple_accel::pointer_pts_per_sec(v, crate::system_prefs::trackpad_scaling()) / v
++                * (self.cursor_accel.px_per_mm_at_ref / 25.0)
++        } else {
++            0.0
++        };
++        let px_x = dx_mm * k;
++        let px_y = dy_mm * k;
+         let total_x = self.cursor_carry_x_px + px_x;
+         let total_y = self.cursor_carry_y_px + px_y;
+         let int_x = total_x.trunc() as i32;
+@@ -1896,7 +1977,7 @@ impl<O: Output> State<O> {
+             let max_move = self.max_move_sq.sqrt();
+             let dur = now - self.started_at;
+             let could_still_tap =
+-                !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
++                taps_on() && !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+             if could_still_tap {
+                 base.last_centroid = centroid;
+                 // Track scale and angle pre-lock so the first Changed
+diff --git a/src/hid.rs b/src/hid.rs
+index c5a627f..4bede1c 100644
+--- a/src/hid.rs
++++ b/src/hid.rs
+@@ -298,6 +298,82 @@ struct DeviceState {
+     /// own free-running scan_time counter, so each gets its own clock.
+     scan_clock: ScanTimeClock,
+     control_path: ControlPath,
++    /// Jitter buffer: frames are released at their scan-time rhythm,
++    /// delayed just enough to absorb delivery bursts (Bluetooth).
++    jitter: JitterBuffer,
++}
++
++/// Adaptive de-jitter buffer. Each frame's excess delay (arrival minus
++/// the scan-clock-aligned time, i.e. how late it is versus the fastest
++/// delivery path) is recorded; the release delay is a high percentile of
++/// recent excess delays, so a USB link (≈0 ms excess) adds almost no
++/// latency while a bursty Bluetooth link is smoothed out.
++struct JitterBuffer {
++    queue: std::collections::VecDeque<(Frame, Timestamp)>,
++    excess_ms: std::collections::VecDeque<f64>,
++    delay_ms: f64,
++    last_due: Option<Timestamp>,
++    timer: Option<Timer>,
++    frames_since_update: u32,
++}
++
++impl JitterBuffer {
++    const SAMPLES: usize = 256;
++    const PERCENTILE: f64 = 0.90;
++    const MAX_DELAY_MS: f64 = 20.0;
++
++    fn new() -> Self {
++        Self {
++            queue: std::collections::VecDeque::new(),
++            excess_ms: std::collections::VecDeque::with_capacity(Self::SAMPLES),
++            delay_ms: 0.0,
++            last_due: None,
++            timer: None,
++            frames_since_update: 0,
++        }
++    }
++
++    fn record(&mut self, excess_ms: f64) {
++        if self.excess_ms.len() == Self::SAMPLES {
++            self.excess_ms.pop_front();
++        }
++        self.excess_ms.push_back(excess_ms);
++        self.frames_since_update += 1;
++        if self.frames_since_update >= 32 && self.excess_ms.len() >= 32 {
++            self.frames_since_update = 0;
++            let mut v: Vec<f64> = self.excess_ms.iter().copied().collect();
++            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
++            let target = v[((v.len() - 1) as f64 * Self::PERCENTILE) as usize].min(Self::MAX_DELAY_MS);
++            // Move gently so the release rhythm doesn't jump.
++            let new = self.delay_ms + (target - self.delay_ms) * 0.25;
++            if (new - self.delay_ms).abs() >= 0.5 {
++                log::debug!("jitter buffer: delay {:.1} ms (p90 excess {:.1} ms)", new, target);
++            }
++            self.delay_ms = new;
++        }
++    }
++}
++
++/// Release every queued frame whose due time has come; re-arm the timer
++/// for the next one.
++fn jitter_drain(state: &mut DeviceState) {
++    let bridge = unsafe { &mut *state.bridge };
++    let now = Timestamp::now();
++    while let Some((_, due)) = state.jitter.queue.front() {
++        if *due > now + std::time::Duration::from_micros(300) {
++            break;
++        }
++        let (frame, due) = state.jitter.queue.pop_front().unwrap();
++        (bridge.on_frame)(frame, due);
++    }
++    if let Some((_, due)) = state.jitter.queue.front() {
++        let wait = due.saturating_duration_since(now).as_secs_f64();
++        let ptr = state as *mut DeviceState;
++        state.jitter.timer = Some(Timer::new(wait, 0.0, move || {
++            let state = unsafe { &mut *ptr };
++            jitter_drain(state);
++        }));
++    }
+ }
+ 
+ impl Drop for DeviceState {
+@@ -867,6 +943,7 @@ unsafe extern "C" fn on_device_matched(
+         bridge: bridge as *mut Bridge,
+         scan_clock: ScanTimeClock::new(),
+         control_path,
++        jitter: JitterBuffer::new(),
+     });
+ 
+     unsafe {
+@@ -1212,7 +1289,19 @@ unsafe extern "C" fn on_input_report(
+     let aligned_ts = state
+         .scan_clock
+         .observe(frame.scan_time_100us, Timestamp::now());
+-    (bridge.on_frame)(frame, aligned_ts);
++    let _ = bridge;
++    let now = Timestamp::now();
++    let excess_ms = now.saturating_duration_since(aligned_ts).as_secs_f64() * 1000.0;
++    state.jitter.record(excess_ms);
++    let mut due = aligned_ts + std::time::Duration::from_micros((state.jitter.delay_ms * 1000.0) as u64);
++    if let Some(last) = state.jitter.last_due {
++        if due < last {
++            due = last; // keep release order and monotonic timestamps
++        }
++    }
++    state.jitter.last_due = Some(due);
++    state.jitter.queue.push_back((frame, due));
++    jitter_drain(state);
+ }
+ 
+ fn hex(bytes: &[u8]) -> String {
+diff --git a/src/lib.rs b/src/lib.rs
+index ff357c9..d894224 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,6 +5,7 @@
+ 
+ pub mod about;
+ pub mod app_context;
++pub mod apple_accel;
+ pub mod app_kit;
+ pub mod capture;
+ pub mod config;
+diff --git a/src/output.rs b/src/output.rs
+index b8093d9..066dfee 100644
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -139,10 +139,23 @@ pub fn accelerate_scroll(v_mm_per_sec: f64, curve: ScrollAccel) -> f64 {
+     if mag == 0.0 {
+         return 0.0;
+     }
+-    // LINEAR = sensitivity × REF^(1 - EXPONENT). At v == REF this gives
+-    // pixels_per_sec = sensitivity × REF (matches linear feel).
+-    let linear = curve.px_per_mm_at_ref * curve.ref_mm_per_sec.powf(1.0 - curve.exponent);
+-    v_mm_per_sec.signum() * linear * mag.powf(curve.exponent)
++    #[cfg(not(test))]
++    {
++        // Curva di scorrimento di Apple (trackpad del MacBook). La
++        // "sensibilita' scorrimento" dell'app resta come moltiplicatore:
++        // 20 (il valore predefinito) = esattamente come Apple.
++        let scale = curve.px_per_mm_at_ref / 20.0;
++        v_mm_per_sec.signum()
++            * scale
++            * crate::apple_accel::scroll_pts_per_sec(mag, crate::system_prefs::trackpad_scroll_scaling())
++    }
++    #[cfg(test)]
++    {
++        // LINEAR = sensitivity × REF^(1 - EXPONENT). At v == REF this gives
++        // pixels_per_sec = sensitivity × REF (matches linear feel).
++        let linear = curve.px_per_mm_at_ref * curve.ref_mm_per_sec.powf(1.0 - curve.exponent);
++        v_mm_per_sec.signum() * linear * mag.powf(curve.exponent)
++    }
+ }
+ 
+ /// Conversion to the actual pixel fields, independent of CGEvent posting.
+@@ -1732,6 +1745,19 @@ fn post_dock_swipe(
+     velocity: Option<f64>,
+     ts: Timestamp,
+ ) {
++    // macOS 27+ ignores the private CGEvent fields below and reads an
++    // IOHIDEvent attached to the event instead. See `dock_swipe_hid`.
++    if dock_swipe_hid::available() {
++        let Some(event) = Event::with_source(source) else {
++            return;
++        };
++        unsafe { dock_swipe_hid::CGEventSetType(event.0, kCGSEventDockControl as u32) };
++        if dock_swipe_hid::attach(event.0, motion, phase, origin_offset, velocity) {
++            unsafe { CGEventSetTimestamp(event.0, ts.as_nanos()) };
++            event.post_to(kCGSessionEventTap);
++            return;
++        }
++    }
+     let Some(event) = Event::with_source(source) else {
+         return;
+     };
+@@ -1753,6 +1779,145 @@ fn post_dock_swipe(
+     event.post_to(kCGSessionEventTap);
+ }
+ 
++/// macOS 27 DockSwipe: the Dock now reads an `IOHIDEvent` (type 23,
++/// DockSwipe) attached to the type-30 CGEvent instead of the private
++/// CGEvent gesture fields. Event layout follows Mac Mouse Fix's
++/// investigation (commit f92d2d53a) and OpenLogi's Apache-2.0 Rust port
++/// (`openlogi-inject/src/inject/macos/spaces.rs`, PR #1703): phase in the
++/// options word, motion / flavor / progress fields, and a Velocity child
++/// on the end phase. macOS 27 reads progress with the opposite sign when
++/// natural scrolling is on.
++mod dock_swipe_hid {
++    use objc2::msg_send;
++    use objc2::rc::{Allocated, Retained};
++    use objc2::runtime::{AnyClass, AnyObject};
++    use std::ffi::c_void;
++    use std::sync::OnceLock;
++
++    unsafe extern "C" {
++        pub fn CGEventSetType(event: *mut c_void, ty: u32);
++    }
++
++    const HID_TYPE_VELOCITY: u32 = 9;
++    const HID_TYPE_DOCK_SWIPE: u32 = 23;
++    const FIELD_MOTION: u32 = HID_TYPE_DOCK_SWIPE << 16 | 1;
++    const FIELD_PROGRESS: u32 = HID_TYPE_DOCK_SWIPE << 16 | 2;
++    const FIELD_FLAVOR: u32 = HID_TYPE_DOCK_SWIPE << 16 | 5;
++    const FIELD_VELOCITY_X: u32 = HID_TYPE_VELOCITY << 16;
++    const FIELD_VELOCITY_Y: u32 = HID_TYPE_VELOCITY << 16 | 1;
++    const FLAVOR_DOCK_PRIMARY: isize = 3;
++    const PHASE_SHIFT: u32 = 24;
++
++    type SetHidEvent = unsafe extern "C" fn(*mut c_void, *const c_void);
++
++    struct Api {
++        class: &'static AnyClass,
++        attach: SetHidEvent,
++    }
++
++    fn os_major() -> u32 {
++        let mut buf = [0u8; 32];
++        let mut len = buf.len();
++        let rc = unsafe {
++            libc::sysctlbyname(
++                c"kern.osproductversion".as_ptr(),
++                buf.as_mut_ptr() as *mut c_void,
++                &mut len,
++                std::ptr::null_mut(),
++                0,
++            )
++        };
++        if rc != 0 {
++            return 0;
++        }
++        let s = String::from_utf8_lossy(&buf[..len.saturating_sub(1)]).into_owned();
++        s.split('.').next().and_then(|m| m.trim_matches('\0').parse().ok()).unwrap_or(0)
++    }
++
++    fn api() -> Option<&'static Api> {
++        static API: OnceLock<Option<Api>> = OnceLock::new();
++        API.get_or_init(|| {
++            let major = os_major();
++            if major < 27 {
++                log::info!("DockSwipe: macOS {major}, using CGEvent fields");
++                return None;
++            }
++            unsafe {
++                libc::dlopen(c"/System/Library/Frameworks/IOKit.framework/IOKit".as_ptr(), libc::RTLD_LAZY);
++            }
++            let handle = unsafe {
++                libc::dlopen(
++                    c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight".as_ptr(),
++                    libc::RTLD_LAZY,
++                )
++            };
++            if handle.is_null() {
++                log::warn!("DockSwipe: SkyLight not loadable; swipes will not animate");
++                return None;
++            }
++            let sym = unsafe { libc::dlsym(handle, c"SLEventSetIOHIDEvent".as_ptr()) };
++            if sym.is_null() {
++                log::warn!("DockSwipe: SLEventSetIOHIDEvent not found");
++                return None;
++            }
++            let Some(class) = AnyClass::get(c"HIDEvent") else {
++                log::warn!("DockSwipe: HIDEvent class not found");
++                return None;
++            };
++            log::info!("DockSwipe: macOS {major}, using attached IOHIDEvent");
++            let attach = unsafe { std::mem::transmute::<*mut c_void, SetHidEvent>(sym) };
++            Some(Api { class, attach })
++        })
++        .as_ref()
++    }
++
++    pub fn available() -> bool {
++        api().is_some()
++    }
++
++    fn new_event(class: &AnyClass, kind: u32) -> Option<Retained<AnyObject>> {
++        unsafe {
++            let this: Allocated<AnyObject> = msg_send![class, alloc];
++            msg_send![this, initWithType: kind, timestamp: 0_u64, senderID: 0_u64]
++        }
++    }
++
++    /// Build the DockSwipe IOHIDEvent and attach it to `event`.
++    /// `origin_offset` and `velocity` use the legacy field convention.
++    pub fn attach(event: *mut c_void, motion: i64, phase: i64, origin_offset: f64, velocity: Option<f64>) -> bool {
++        let Some(api) = api() else { return false };
++        // macOS 27 reads the horizontal sign reversed under natural
++        // scrolling; the vertical axis keeps the legacy sign (measured:
++        // flipping it put Mission Control on a downward swipe).
++        let flip = if motion == 2 {
++            1.0
++        } else if crate::system_prefs::natural_scrolling() {
++            -1.0
++        } else {
++            1.0
++        };
++        let progress = flip * origin_offset;
++        let Some(hid) = new_event(api.class, HID_TYPE_DOCK_SWIPE) else { return false };
++        unsafe {
++            let _: () = msg_send![&*hid, setOptions: (phase as u32) << PHASE_SHIFT];
++            let _: () = msg_send![&*hid, setIntegerValue: motion as isize, forField: FIELD_MOTION];
++            let _: () = msg_send![&*hid, setIntegerValue: FLAVOR_DOCK_PRIMARY, forField: FIELD_FLAVOR];
++            let _: () = msg_send![&*hid, setDoubleValue: progress, forField: FIELD_PROGRESS];
++            if phase == 4 || phase == 8 {
++                let Some(child) = new_event(api.class, HID_TYPE_VELOCITY) else { return false };
++                // Points the way progress does.
++                let v = flip * -velocity.unwrap_or(0.0);
++                let _: () = msg_send![&*child, setDoubleValue: v, forField: FIELD_VELOCITY_X];
++                let _: () = msg_send![&*child, setDoubleValue: v, forField: FIELD_VELOCITY_Y];
++                let _: () = msg_send![&*hid, appendEvent: &*child];
++            }
++            (api.attach)(event, Retained::as_ptr(&hid).cast());
++        }
++        log::trace!("DockSwipe(HID) motion={motion} phase={phase} progress={progress:+.3}");
++        true
++    }
++}
++
+ /// Post a single phased scroll event. Exactly one of `scroll_phase` and
+ /// `momentum_phase` should carry the active phase; the other goes on
+ /// the wire as `PHASE_NONE` (encoded by passing `Phase::Cancelled` for
+diff --git a/src/system_prefs.rs b/src/system_prefs.rs
+index 513a578..348f7cf 100644
+--- a/src/system_prefs.rs
++++ b/src/system_prefs.rs
+@@ -76,3 +76,105 @@ fn read_flag(domain: &str, key: &str) -> bool {
+     unsafe { CFRelease(value as CFTypeRef) };
+     set
+ }
++
++/// Natural scrolling (`com.apple.swipescrolldirection` in the global
++/// domain). Absent means on, the macOS default.
++pub fn natural_scrolling() -> bool {
++    let cf_key = CFString::new("com.apple.swipescrolldirection");
++    let value = unsafe {
++        CFPreferencesCopyAppValue(
++            cf_key.as_concrete_TypeRef(),
++            core_foundation_sys::preferences::kCFPreferencesAnyApplication,
++        )
++    };
++    if value.is_null() {
++        return true;
++    }
++    let on = unsafe {
++        if CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID() {
++            CFBooleanGetValue(value as CFBooleanRef)
++        } else if CFGetTypeID(value as CFTypeRef) == CFNumberGetTypeID() {
++            let mut n: i32 = 1;
++            CFNumberGetValue(value as CFNumberRef, kCFNumberIntType, &mut n as *mut i32 as *mut std::ffi::c_void);
++            n != 0
++        } else {
++            true
++        }
++    };
++    unsafe { CFRelease(value as CFTypeRef) };
++    on
++}
++
++// ---------------------------------------------------------------------------
++// Impostazioni del trackpad del Mac, rilette al massimo ogni 2 secondi
++// (si leggono a ogni frame del trackpad).
++
++struct TrackpadPrefs {
++    letto: Option<std::time::Instant>,
++    scaling: f64,
++    scroll: f64,
++    taps: bool,
++}
++
++static TRACKPAD_PREFS: std::sync::Mutex<TrackpadPrefs> =
++    std::sync::Mutex::new(TrackpadPrefs { letto: None, scaling: 0.6875, scroll: 0.3125, taps: false });
++
++fn read_global_f64(key: &str) -> Option<f64> {
++    let cf_key = CFString::new(key);
++    let value = unsafe {
++        CFPreferencesCopyAppValue(
++            cf_key.as_concrete_TypeRef(),
++            core_foundation_sys::preferences::kCFPreferencesAnyApplication,
++        )
++    };
++    if value.is_null() {
++        return None;
++    }
++    let out = unsafe {
++        if CFGetTypeID(value as CFTypeRef) == CFNumberGetTypeID() {
++            let mut n: f64 = 0.0;
++            let ok = CFNumberGetValue(
++                value as CFNumberRef,
++                core_foundation_sys::number::kCFNumberDoubleType,
++                &mut n as *mut f64 as *mut std::ffi::c_void,
++            );
++            if ok && n.is_finite() { Some(n) } else { None }
++        } else {
++            None
++        }
++    };
++    unsafe { CFRelease(value as CFTypeRef) };
++    out
++}
++
++fn trackpad_prefs() -> (f64, f64, bool) {
++    let mut p = match TRACKPAD_PREFS.lock() {
++        Ok(p) => p,
++        Err(e) => e.into_inner(),
++    };
++    let scaduto = p.letto.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(2));
++    if scaduto {
++        // Valori assenti = predefiniti di macOS (letti con ioreg sul MacBook:
++        // HIDPointerAcceleration 45056, HIDTrackpadScrollAcceleration 20480).
++        p.scaling = read_global_f64("com.apple.trackpad.scaling").unwrap_or(0.6875).clamp(0.0, 3.0);
++        p.scroll = read_global_f64("com.apple.trackpad.scrolling").unwrap_or(0.3125).clamp(0.0, 3.0);
++        p.taps = DOMAINS.iter().any(|domain| read_flag(domain, "Clicking"));
++        p.letto = Some(std::time::Instant::now());
++    }
++    (p.scaling, p.scroll, p.taps)
++}
++
++/// "Velocita' di tracciamento" del trackpad (0..3).
++pub fn trackpad_scaling() -> f64 {
++    trackpad_prefs().0
++}
++
++/// Velocita' di scorrimento del trackpad (0..3).
++pub fn trackpad_scroll_scaling() -> f64 {
++    trackpad_prefs().1
++}
++
++/// "Tocca per fare clic" attivo nelle Impostazioni di Sistema.
++pub fn tap_to_click() -> bool {
++    trackpad_prefs().2
++}
+diff --git a/src/apple_accel.rs b/src/apple_accel.rs
+new file mode 100644
+index 0000000..1f635de
+--- /dev/null
++++ b/src/apple_accel.rs
+@@ -0,0 +1,153 @@
++//! Curve di accelerazione di Apple per i trackpad, copiate dal trackpad
++//! integrato del MacBook (ioreg: `HIDAccelCurves` e `HIDScrollAccelCurves`
++//! di AppleMultitouchTrackpadHIDEventDriver, 17/11/2026).
++//!
++//! L'algoritmo e' quello "parametrico" di IOHIDFamily (IOHIPointing.cpp,
++//! `PACurvesSetupAccelParams` / `PACurvesGetAccelerationMultiplier`):
++//! - le curve sono indicizzate dal cursore "Velocita' di tracciamento"
++//!   (`com.apple.trackpad.scaling`, 0..3); tra due curve si interpola;
++//! - velocita' standardizzata s in pollici al secondo;
++//! - fino a TangentSpeedLinear: polinomio G1 s + G2 s^2 + G3 s^3 + G4 s^4;
++//!   poi la sua tangente fino a TangentSpeedParabolicRoot; poi una radice;
++//! - uscita: 96 punti per pollice di "velocita' accelerata".
++
++#[derive(Clone, Copy, Debug)]
++struct Curve {
++    index: f64,
++    g: [f64; 4],
++    t0: f64, // TangentSpeedLinear
++    t1: f64, // TangentSpeedParabolicRoot
++}
++
++const F: f64 = 65536.0;
++
++const fn c(index: f64, g1: f64, g2: f64, g3: f64, t0: f64, t1: f64) -> Curve {
++    Curve { index: index / F, g: [g1 / F, g2 / F, g3 / F, 0.0], t0: t0 / F, t1: t1 / F }
++}
++
++/// HIDAccelCurves del MacBook (puntatore).
++const POINTER: [Curve; 10] = [
++    c(0.0, 65536.0, 0.0, 0.0, 484966.0, 1376256.0),
++    c(8192.0, 64881.0, 32768.0, 5243.0, 478413.0, 1310720.0),
++    c(32768.0, 64225.0, 43254.0, 6554.0, 471859.0, 1245184.0),
++    c(45056.0, 62915.0, 54395.0, 7864.0, 465306.0, 1179648.0),
++    c(57344.0, 61604.0, 65536.0, 9830.0, 458752.0, 1114112.0),
++    c(65536.0, 60293.0, 75366.0, 11796.0, 458752.0, 1048576.0),
++    c(98304.0, 58327.0, 85197.0, 13763.0, 458752.0, 983040.0),
++    c(131072.0, 56361.0, 95027.0, 15729.0, 458752.0, 917504.0),
++    c(163840.0, 54395.0, 108790.0, 18350.0, 458752.0, 851968.0),
++    c(196608.0, 65536.0, 123208.0, 23593.0, 458752.0, 786432.0),
++];
++
++/// HIDScrollAccelCurves del MacBook (scorrimento).
++const SCROLL: [Curve; 10] = [
++    c(0.0, 65536.0, 0.0, 0.0, 393216.0, 786432.0),
++    c(8192.0, 62259.0, 39322.0, 0.0, 406323.0, 786432.0),
++    c(32768.0, 58982.0, 58982.0, 0.0, 419430.0, 786432.0),
++    c(45056.0, 55706.0, 78643.0, 0.0, 432538.0, 786432.0),
++    c(57344.0, 52429.0, 91750.0, 0.0, 445645.0, 786432.0),
++    c(65536.0, 49152.0, 104858.0, 0.0, 458752.0, 786432.0),
++    c(98304.0, 45875.0, 117965.0, 0.0, 471859.0, 786432.0),
++    c(131072.0, 42598.0, 131072.0, 0.0, 484966.0, 786432.0),
++    c(163840.0, 39322.0, 144179.0, 0.0, 498074.0, 786432.0),
++    c(196608.0, 36045.0, 157286.0, 0.0, 511181.0, 786432.0),
++];
++
++/// Curva per l'indice voluto, interpolata tra le due vicine (come Apple).
++fn interpolate(curves: &[Curve], desired: f64) -> Curve {
++    let desired = desired.clamp(curves[0].index, curves[curves.len() - 1].index);
++    for w in curves.windows(2) {
++        let (lo, hi) = (w[0], w[1]);
++        if desired <= hi.index {
++            if hi.index <= lo.index {
++                return hi;
++            }
++            let r = (desired - lo.index) / (hi.index - lo.index);
++            let mut out = hi;
++            out.index = desired;
++            for i in 0..4 {
++                out.g[i] = (lo.g[i] + (hi.g[i] - lo.g[i]) * r).max(0.0);
++            }
++            out.t0 = (lo.t0 + (hi.t0 - lo.t0) * r).max(0.0);
++            out.t1 = (lo.t1 + (hi.t1 - lo.t1) * r).max(0.0);
++            return out;
++        }
++    }
++    curves[curves.len() - 1]
++}
++
++fn q(c: &Curve, x: f64) -> f64 {
++    x * (c.g[0] + x * (c.g[1] + x * (c.g[2] + x * c.g[3])))
++}
++
++fn dq(c: &Curve, x: f64) -> f64 {
++    c.g[0] + x * (2.0 * c.g[1] + x * (3.0 * c.g[2] + x * 4.0 * c.g[3]))
++}
++
++/// Velocita' accelerata (pollici/s "virtuali") per una velocita' s in pollici/s.
++fn evaluate(c: &Curve, s: f64) -> f64 {
++    if s <= 0.0 {
++        return 0.0;
++    }
++    let first_tangent = c.t1 > 0.0 && c.t1 < c.t0;
++    let (m0, b0, y1) = if !first_tangent {
++        let y0 = q(c, c.t0);
++        let m0 = dq(c, c.t0);
++        let b0 = y0 - m0 * c.t0;
++        (m0, b0, m0 * c.t1 + b0)
++    } else {
++        (dq(c, c.t1), 0.0, q(c, c.t1))
++    };
++    let m_root = 2.0 * m0 * y1;
++    let b_root = y1 * y1 - m_root * c.t1;
++    let t_first = if first_tangent { c.t1 } else { c.t0 };
++    if t_first != 0.0 && s <= t_first {
++        q(c, s)
++    } else if !first_tangent && c.t1 != 0.0 && s <= c.t1 {
++        m0 * s + b0
++    } else {
++        (m_root * s + b_root).max(0.0).sqrt()
++    }
++}
++
++const MM_PER_INCH: f64 = 25.4;
++const POINTS_PER_INCH: f64 = 96.0;
++
++/// Puntatore: punti/secondo per una velocita' del dito in mm/s.
++/// `scaling` e' il valore di "Velocita' di tracciamento" (0..3).
++pub fn pointer_pts_per_sec(v_mm_per_sec: f64, scaling: f64) -> f64 {
++    let curve = interpolate(&POINTER, scaling);
++    POINTS_PER_INCH * evaluate(&curve, v_mm_per_sec.abs() / MM_PER_INCH)
++}
++
++/// Scorrimento: punti/secondo per una velocita' delle dita in mm/s.
++/// `scaling` e' la velocita' di scorrimento del trackpad (0..3).
++pub fn scroll_pts_per_sec(v_mm_per_sec: f64, scaling: f64) -> f64 {
++    let curve = interpolate(&SCROLL, scaling);
++    POINTS_PER_INCH * evaluate(&curve, v_mm_per_sec.abs() / MM_PER_INCH)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn continuous_and_increasing() {
++        for scaling in [0.0, 0.3125, 0.6875, 1.5, 3.0] {
++            let mut prev = 0.0;
++            let mut v = 0.5;
++            while v < 2000.0 {
++                let p = pointer_pts_per_sec(v, scaling);
++                assert!(p >= prev, "scaling {scaling} v {v}: {p} < {prev}");
++                prev = p;
++                v *= 1.05;
++            }
++        }
++    }
++
++    #[test]
++    fn slow_motion_is_about_96_points_per_inch() {
++        let gain = pointer_pts_per_sec(1.0, 0.6875) / 1.0; // pt per mm at 1 mm/s
++        assert!((gain - 96.0 / 25.4 * 0.96).abs() < 0.2, "{gain}");
++    }
++}

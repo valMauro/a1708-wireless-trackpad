@@ -1,0 +1,12 @@
+# firmware builds
+firmware/build*/
+# case generator output
+hardware/case/source/out/
+__pycache__/
+*.pyc
+# KiCad local files
+*.kicad_prl
+*-backups/
+fp-info-cache
+# macOS
+.DS_Store
